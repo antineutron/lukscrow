@@ -1,0 +1,222 @@
+#!/usr/bin/env python
+
+import ldap
+import ldap.sasl
+import ldap.modlist
+import uuid
+import string
+import random
+import getpass
+import datetime
+import os
+import platform
+import argparse
+import tempfile
+import subprocess
+
+def get_args():
+    """
+    Parses and validates command line arguments
+    """
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--luks-device',
+                        required=True,
+                        type=check_luks_device,
+                        action='store',
+                        help='Generate a key for the specified LUKS-enabled device')
+
+    parser.add_argument('--ldap-url',
+                        required=True,
+                        type=str,
+                        action='store',
+                        help='LDAP URL for connecting to Active Directory')
+
+    parser.add_argument('--computers-base-dn',
+                        required=True,
+                        type=str,
+                        action='store',
+                        help='Base DN in active directory for finding the computer object')
+
+    parser.add_argument('--keytab',
+                        type=str,
+                        action='store',
+                        default='/etc/krb5.keytab',
+                        help='Kerberos keytab file used to authenticate to AD (defaults to the machine keytab)')
+
+    parser.add_argument('--unlock-key',
+                        required=True,
+                        type=str,
+                        action='store',
+                        help='Existing key for unlocking the LUKS-enabled device')
+
+    parser.add_argument('--remove-original-key',
+                        action='store_true',
+                        default=False,
+                        help='Should we remove the original unlock key after setting the new one?')
+
+    args = parser.parse_args()
+
+    return args
+    
+
+def connect_ad(dc_url):
+    """
+    Connects to active directory using GSSAPI
+    """
+    con = ldap.initialize(dc_url, bytes_mode=False)
+    ldap.set_option(ldap.OPT_REFERRALS, 0)
+    ldap.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+    auth_tokens = ldap.sasl.gssapi()
+    con.sasl_interactive_bind_s('', auth_tokens)
+
+    print("Connected to AD as '{}'".format(con.whoami_s()))
+
+    return con
+
+
+def lookup_computer(con, computers_base_dn, hostname):
+    """
+    Looks up a computer account in AD and returns the full DN.
+    """
+    results = con.search_s(computers_base_dn, ldap.SCOPE_SUBTREE, '(&(objectclass=computer)(cn={}))'.format(hostname.upper()), ['cn'])
+    return results[0][0]
+
+
+def generate_recovery_key():
+    """
+    Randomly generates a recovery key in Bitlocker-esque format
+    (e.g. XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+    where X is a random digit 0-9)
+    """
+
+    char_range = string.digits
+    parts = []
+    for _ in range(8):
+        parts.append(''.join(random.SystemRandom().choice(char_range) for _ in range(6)))
+    return '-'.join(parts)
+
+
+def generate_recovery_info(computer_dn):
+    """
+    Generates AD-compatible attributes and DN for storing recovery info.
+    Can be passed to an LDAP add command.
+    """
+
+    # Get a formatted timestamp, GUID and random key
+    recovery_timestamp = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+    recovery_guid = uuid.uuid4()
+    recovery_key = generate_recovery_key()
+
+    # Generate the CN and full DN for the recovery info object
+    # Sorry about this - needs to look like '2018-10-11T12:14:15-00:00{some-guid-stuff-here}' hence the extra escaped braces
+    recovery_cn = '{}-00:00{{{}}}'.format(recovery_timestamp, str(recovery_guid))
+    recovery_dn = 'CN={},{}'.format(recovery_cn, computer_dn)
+
+    # Bytes-ify for compatibility with LDAP
+    recovery_key = bytes(recovery_key, encoding='ascii')
+    recovery_guid = recovery_guid.bytes
+
+    return (recovery_dn, {
+        'objectclass': bytes('msFVE-RecoveryInformation', encoding='ascii'),
+        'cn': bytes(recovery_cn, encoding='ascii'),
+        'msFVE-RecoveryGuid': recovery_guid,
+        'msFVE-RecoveryPassword': recovery_key,
+    })
+
+
+def gen_credentials_cache(keytab, principal):
+    """
+    Creates a Kerberos credentials cache in a temp file using the details from the specified keytab.
+    This avoids weird problems where no cache file exists, or the user already has a cache
+    file using their own creds instead of the machine keytab.
+    :param: keytab Filename of the keytab to use (e.g. the host keytab)
+    :param: principal Kerberos security principal name to use e.g. the hostname
+    """
+    cachefile=tempfile.mkstemp()
+    subprocess.check_call(['kinit', '-k', '-t', keytab, '-c', cachefile[1], principal])
+    return cachefile
+
+
+def check_luks_device(device):
+    """
+    Validates that a specified device is really a LUKS-encrypted device.
+    """
+    try:
+        subprocess.check_call(['cryptsetup', 'isLuks', device])
+    except subprocess.CalledProcessError:
+        raise argparse.ArgumentError(None, "Device '{}' is not a luks device".format(device))
+    return device
+
+
+def add_luks_key(device, unlock_key, new_key):
+    """
+    Adds a key to a LUKS device, given an existing key.
+    """
+    cmd = subprocess.Popen(['cryptsetup', 'luksAddKey', device], stdin=subprocess.PIPE)
+    cmd.stdin.write(bytes(unlock_key + '\n', encoding='utf-8'))
+    cmd.stdin.write(new_key)
+    cmd.stdin.write(bytes('\n', encoding='utf-8'))
+    cmd.stdin.write(new_key)
+    cmd.stdin.write(bytes('\n', encoding='utf-8'))
+    cmd.stdin.close()
+    if cmd.wait() != 0:
+        raise Exception("Failed to add new LUKS key")
+
+
+def remove_luks_key(device, key):
+    """
+    Removes an existing LUKS key from a device.
+    """
+    cmd = subprocess.Popen(['cryptsetup', 'luksRemoveKey', device], stdin=subprocess.PIPE)
+    cmd.stdin.write(bytes(key + '\n', encoding='utf-8'))
+    cmd.stdin.close()
+    if cmd.wait() != 0:
+        raise Exception("Failed to remove LUKS key")
+    else:
+        print("Removed LUKS key")
+
+
+def main():
+
+    # Parse arguments
+    args = get_args()
+
+    # Get the hostname, uppercase it and add a $ to the end - this is the
+    # required format for the host's kerberos principal e.g. MYHOSTNAME$
+    hostname = platform.node()
+    principal = hostname.upper() + '$'
+
+    # Sort out kerberos creds cache using the keytab
+    cachefile = gen_credentials_cache(args.keytab, principal)
+    os.environ['KRB5_CLIENT_KTNAME'] = args.keytab
+    os.environ['KRB5CCNAME'] = cachefile[1]
+    print("Using Kerberos credential cache {}".format(cachefile[1]))
+
+    con = connect_ad(args.ldap_url)
+
+    # Find our computer info
+    computer_dn = lookup_computer(con, args.computers_base_dn, hostname)
+
+    # Now generate a recovery key, GUID, and associated stuff
+    print("Generating recovery key...")
+    recovery_dn, attrs = generate_recovery_info(computer_dn)
+
+    print("Adding recovery key to LUKS volume...")
+    add_luks_key(args.luks_device, args.unlock_key, attrs['msFVE-RecoveryPassword'])
+    print("New key added.")
+
+    # Store the recovery key info in AD
+    print("Storing recovery key in Active Directory")
+    ldif = ldap.modlist.addModlist(attrs)
+    con.add_s(recovery_dn, ldif)
+    print("Recovery key saved to AD.")
+
+    if args.remove_original_key:
+        print("Removing original unlock key...")
+        remove_luks_key(args.luks_device, args.unlock_key)
+        print("Original key removed.")
+    
+
+if __name__ == '__main__':
+    main()
